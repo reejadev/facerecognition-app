@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Webcam Face Recognizer (Firebase)</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Use Inter font -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        /* Style for the canvas to overlay the video */
+        #video-container {
+            position: relative;
+            max-width: 600px;
+            margin: 0 auto;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+        #video, #canvas {
+            width: 100%;
+            height: auto;
+        }
+        #canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            opacity: 0.8;
+            /* Ensures the canvas takes up the full space of the container */
+            width: 100%; 
+            height: 100%;
+        }
+    </style>
+    <!-- face-api.js and TensorFlow CDN - FIXED PATH -->
+    <!-- Using unpkg CDN with a stable version (0.22.2) to resolve the 404 error -->
+    <script src="https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js"></script>
+</head>
+<body class="bg-gray-50 min-h-screen p-4 sm:p-8">
+
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-3xl sm:text-4xl font-bold text-center text-indigo-700 mb-6">Biometric Login / Registration</h1>
+        <p class="text-center text-gray-600 mb-8">Current User ID: <span id="user-id" class="font-mono bg-indigo-100 p-1 rounded">Loading...</span></p>
+
+        <div id="video-container">
+            <video id="video" autoplay muted playsinline class="rounded-xl"></video>
+            <canvas id="canvas"></canvas>
+            <div id="loading-overlay" class="absolute inset-0 bg-gray-900 bg-opacity-70 flex flex-col items-center justify-center text-white p-4">
+                <svg class="animate-spin -ml-1 mr-3 h-8 w-8 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <p class="mt-4 text-lg" id="loading-message">Loading AI Models (approx 6 MB)...</p>
+            </div>
+        </div>
+
+        <div class="mt-6 flex flex-col sm:flex-row gap-4 justify-center">
+            <button id="register-btn" disabled class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 px-6 rounded-lg shadow-lg transition duration-200 disabled:opacity-50">
+                Register This Face
+            </button>
+            <button id="recognize-btn" disabled class="bg-green-600 hover:bg-green-700 text-white font-semibold py-3 px-6 rounded-lg shadow-lg transition duration-200 disabled:opacity-50">
+                Recognize Face
+            </button>
+        </div>
+
+        <div id="status-box" class="mt-8 p-4 bg-white border border-gray-200 rounded-lg shadow-md">
+            <p class="font-semibold text-gray-800">Status:</p>
+            <p id="status-message" class="text-gray-600">Waiting for models to load and camera access...</p>
+        </div>
+
+        <div id="registered-data" class="mt-8 p-4 bg-white border border-gray-200 rounded-lg shadow-md">
+            <p class="font-semibold text-gray-800">Registered Users:</p>
+            <ul id="registered-list" class="list-disc pl-5 text-sm mt-2 text-gray-600">
+                <!-- Registered users will be listed here -->
+            </ul>
+        </div>
+    </div>
+
+    <!-- FIREBASE INITIALIZATION AND FACE RECOGNITION LOGIC -->
+    <script type="module">
+        // Import Firebase modules using CDN and the latest version (v12.4.0)
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-firestore.js";
+
+        // ***************************************************************
+        // ACTUAL CONFIGURATION FOR 'knightagent' PROJECT
+        // ***************************************************************
+        const YOUR_FIREBASE_CONFIG = {
+            apiKey: "AIzaSyB6mcvZ8SiIiwgdqfsnjhlyBZRPGvFM8Pk",           
+            authDomain: "knightagent.firebaseapp.com", 
+            projectId: "knightagent",                  
+            storageBucket: "knightagent.firebasestorage.app",
+            messagingSenderId: "468554563097",
+            appId: "1:468554563097:web:5e2cc918c2eb5ef1e53488"
+        };
+        
+        // We use the projectId as the application identifier
+        const appId = YOUR_FIREBASE_CONFIG.projectId; 
+        
+        // faceapi is now guaranteed to be globally available from the CDN script tag
+        const faceapi = window.faceapi;
+
+        let app, db, auth;
+        let userId = 'anonymous'; 
+        let isAuthReady = false;
+        let faceMatcher = null;
+        let descriptorsMap = {}; 
+
+        // FIX: Changing to the raw GitHub content path, which is more reliable for direct binary file loading
+        // The unpkg path was still causing 'Failed to fetch' errors for the nested weight files.
+        const MODEL_URL = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights';
+
+        // DOM elements
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const loadingOverlay = document.getElementById('loading-overlay');
+        const loadingMessage = document.getElementById('loading-message');
+        const statusMessage = document.getElementById('status-message');
+        const userIdDisplay = document.getElementById('user-id');
+        const registerBtn = document.getElementById('register-btn');
+        const recognizeBtn = document.getElementById('recognize-btn');
+        const registeredList = document.getElementById('registered-list');
+
+        /** Utility to convert Float32Array to JSON string for Firestore */
+        const serializeDescriptor = (descriptor) => JSON.stringify(Array.from(descriptor));
+
+        /** Utility to convert JSON string back to Float32Array */
+        const deserializeDescriptor = (jsonString) => new Float32Array(JSON.parse(jsonString));
+
+        /** * Firebase Initialization and Authentication 
+         */
+        const setupFirebase = async () => {
+            const firebaseConfig = YOUR_FIREBASE_CONFIG;
+            
+            try {
+                // Initialize using the manually pasted configuration
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Since we are local and cannot use a custom token, we use anonymous sign-in
+                await signInAnonymously(auth);
+
+                // Wait for auth state to be confirmed
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        userIdDisplay.textContent = userId;
+                        isAuthReady = true;
+                        statusMessage.textContent = "Firebase and Auth ready. Loading models...";
+                        loadModelsAndStartCamera();
+                        setupDataListener();
+                    } else {
+                        statusMessage.textContent = "Authentication failed. Cannot proceed.";
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase setup error:", error);
+                let errorMessage = `Firebase setup failed: ${error.message}`;
+                
+                // CRITICAL DEBUGGING GUIDANCE
+                if (error.code === 'auth/configuration-not-found') {
+                    errorMessage = "🔴 AUTH ERROR: Anonymous Sign-in is likely DISABLED in your Firebase Console (Authentication > Sign-in method tab). Please ENABLE it to fix this error.";
+                }
+                
+                statusMessage.textContent = errorMessage;
+            }
+        };
+
+        /** * Matches the canvas drawing buffer resolution to the video stream's intrinsic resolution.
+         * This is necessary for accurate overlay drawing.
+         */
+        const resizeCanvas = () => {
+             if (video.readyState >= 2) {
+                // Ensure canvas dimensions match the video stream's intrinsic resolution
+                const displaySize = { width: video.videoWidth, height: video.videoHeight };
+                faceapi.matchDimensions(canvas, displaySize); 
+            }
+        };
+
+        /** * Load Face Recognition Models 
+         */
+        const loadModelsAndStartCamera = async () => {
+            if (typeof faceapi === 'undefined' || !faceapi.nets) {
+                statusMessage.textContent = "CRITICAL ERROR: Face recognition library (face-api.js) failed to load. Check your internet connection or the CDN link.";
+                return;
+            }
+
+            try {
+                loadingMessage.textContent = "Loading Face Detection, Landmarks, and Recognition models...";
+                
+                await Promise.all([
+                    faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL), // Face Detector
+                    faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL), // Landmark Detector
+                    faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL) // Face Recognizer
+                ]);
+
+                loadingMessage.textContent = "Models loaded successfully! Starting camera...";
+                
+                // Start the webcam
+                const stream = await navigator.mediaDevices.getUserMedia({ video: {} });
+                video.srcObject = stream;
+                
+                video.addEventListener('play', () => {
+                    loadingOverlay.style.display = 'none';
+                    statusMessage.textContent = "Camera started. Ready to Register or Recognize.";
+                    registerBtn.disabled = false;
+                    recognizeBtn.disabled = false;
+                    
+                    // Set initial canvas size
+                    resizeCanvas();
+                    
+                    // Start detection loop
+                    requestAnimationFrame(detectFaceLoop);
+                });
+                
+                // Handle canvas resizing whenever the window size changes
+                window.addEventListener('resize', resizeCanvas);
+
+
+            } catch (error) {
+                console.error("Model loading or camera access error:", error);
+                // Update the status message with the actual error
+                statusMessage.textContent = `Model loading or camera access error: ${error.message}.`;
+            }
+        };
+        
+        /**
+         * Firestore Data Listener - Listens for public descriptors
+         */
+        const setupDataListener = () => {
+            if (!db || !isAuthReady) return;
+
+            // Path for public face descriptors shared across the app
+            // Collection path: /artifacts/{appId}/public/data/face_descriptors
+            const collectionPath = `artifacts/${appId}/public/data/face_descriptors`;
+            const q = collection(db, collectionPath);
+
+            onSnapshot(q, (snapshot) => {
+                descriptorsMap = {};
+                const listHtml = [];
+                snapshot.forEach((doc) => {
+                    const data = doc.data();
+                    try {
+                        // Create LabeledFaceDescriptors for use with FaceMatcher
+                        const descriptorArray = deserializeDescriptor(data.descriptor);
+                        const label = data.userId;
+                        descriptorsMap[label] = new faceapi.LabeledFaceDescriptors(label, [descriptorArray]);
+                        listHtml.push(`<li>${label} (Registered)</li>`);
+                    } catch (e) {
+                        console.error("Failed to parse descriptor for doc:", doc.id, e);
+                    }
+                });
+                registeredList.innerHTML = listHtml.length > 0 ? listHtml.join('') : '<li>No faces registered yet.</li>';
+                
+                // Update faceMatcher whenever data changes
+                const allDescriptors = Object.values(descriptorsMap).flat();
+                // Check if we have descriptors before creating FaceMatcher, otherwise it throws an error
+                if (allDescriptors.length > 0) {
+                   // 0.6 is the threshold distance for recognition
+                   faceMatcher = new faceapi.FaceMatcher(allDescriptors, 0.6); 
+                } else {
+                   faceMatcher = null;
+                }
+
+            }, (error) => {
+                console.error("Firestore listener error:", error);
+                statusMessage.textContent = `Error fetching registered data: ${error.message}`;
+            });
+        };
+
+
+        /**
+         * Continuous Face Detection Loop (for visual feedback)
+         */
+        let recognitionResult = "Detecting...";
+        const detectFaceLoop = async () => {
+            if (!video.paused && !video.ended) {
+                const displaySize = { width: video.videoWidth, height: video.videoHeight };
+                // Ensure canvas drawing dimensions match video stream dimensions (crucial for accurate drawing)
+                faceapi.matchDimensions(canvas, displaySize); 
+
+                const detections = await faceapi.detectSingleFace(video, new faceapi.SsdMobilenetv1Options())
+                    .withFaceLandmarks()
+                    .withFaceDescriptor();
+
+                const ctx = canvas.getContext('2d');
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                if (detections) {
+                    const resizedDetections = faceapi.resizeResults(detections, displaySize);
+                    
+                    // Draw bounding box
+                    const box = resizedDetections.detection.box;
+                    const drawBox = new faceapi.draw.DrawBox(box, { 
+                        label: recognitionResult, 
+                        boxColor: recognitionResult.includes("Recognized") ? 'rgba(52, 211, 153, 0.8)' : 
+                                  recognitionResult.includes("Unknown") ? 'rgba(239, 68, 68, 0.8)' : 
+                                  'rgba(99, 102, 241, 0.8)' 
+                    });
+                    drawBox.draw(canvas);
+                }
+                
+                requestAnimationFrame(detectFaceLoop);
+            }
+        };
+
+        /** * Button Handlers
+         */
+        
+        // --- 1. Registration Logic ---
+        registerBtn.addEventListener('click', async () => {
+            if (!isAuthReady) {
+                statusMessage.textContent = "Not connected to Firebase. Please wait for initialization.";
+                return;
+            }
+            
+            statusMessage.textContent = "Capturing face for registration...";
+            recognitionResult = "Registering...";
+            registerBtn.disabled = true;
+            recognizeBtn.disabled = true;
+
+            try {
+                // Get the latest detection with descriptor
+                const detection = await faceapi.detectSingleFace(video, new faceapi.SsdMobilenetv1Options())
+                    .withFaceLandmarks()
+                    .withFaceDescriptor();
+
+                if (!detection) {
+                    statusMessage.textContent = "No face detected! Please center your face in the camera.";
+                    recognitionResult = "No face detected!";
+                    return;
+                }
+
+                // The face descriptor is a Float32Array of 128 numbers
+                const descriptor = detection.descriptor;
+                const descriptorString = serializeDescriptor(descriptor);
+
+                // Document path: /artifacts/{appId}/public/data/face_descriptors/{userId}
+                const docPath = `artifacts/${appId}/public/data/face_descriptors/${userId}`;
+                
+                await setDoc(doc(db, docPath), {
+                    userId: userId,
+                    descriptor: descriptorString,
+                    timestamp: new Date().toISOString()
+                });
+
+                statusMessage.textContent = `Registration successful for user: ${userId}. Descriptor saved to Firestore.`;
+                recognitionResult = `Registered: ${userId}`;
+
+            } catch (error) {
+                console.error("Registration error:", error);
+                statusMessage.textContent = `Registration failed: ${error.message}`;
+                recognitionResult = "Registration Failed";
+            } finally {
+                registerBtn.disabled = false;
+                recognizeBtn.disabled = false;
+            }
+        });
+
+        // --- 2. Recognition Logic ---
+        recognizeBtn.addEventListener('click', async () => {
+            statusMessage.textContent = "Attempting to recognize face...";
+            recognitionResult = "Recognizing...";
+            registerBtn.disabled = true;
+            recognizeBtn.disabled = true;
+
+            try {
+                // Check if any descriptors are loaded
+                if (!faceMatcher) {
+                    statusMessage.textContent = "Recognition failed: No faces are registered in the database.";
+                    recognitionResult = "No Registered Faces";
+                    return;
+                }
+                
+                // Get the detection and descriptor for the current face
+                const detection = await faceapi.detectSingleFace(video, new faceapi.SsdMobilenetv1Options())
+                    .withFaceLandmarks()
+                    .withFaceDescriptor();
+
+                if (!detection) {
+                    statusMessage.textContent = "No face detected for recognition.";
+                    recognitionResult = "No face detected!";
+                    return;
+                }
+                
+                // Use the FaceMatcher to find the best match
+                const bestMatch = faceMatcher.findBestMatch(detection.descriptor);
+                
+                if (bestMatch.label !== 'unknown') {
+                    statusMessage.textContent = `✅ Face Recognized! Welcome back, user: ${bestMatch.label} (Distance: ${bestMatch.distance.toFixed(3)})`;
+                    recognitionResult = `Recognized: ${bestMatch.label}`;
+                } else {
+                    statusMessage.textContent = `❌ Face not recognized. Distance: ${bestMatch.distance.toFixed(3)}`;
+                    recognitionResult = `Unknown (Distance: ${bestMatch.distance.toFixed(3)})`;
+                }
+
+            } catch (error) {
+                console.error("Recognition error:", error);
+                statusMessage.textContent = `Recognition failed: ${error.message}`;
+                recognitionResult = "Recognition Failed";
+            } finally {
+                registerBtn.disabled = false;
+                recognizeBtn.disabled = false;
+            }
+        });
+
+        // Start the application after all imports and scripts have loaded,
+        // ensuring the face-api.js global variable is fully available.
+        window.addEventListener('load', setupFirebase);
+
+    </script>
+</body>
+</html>
